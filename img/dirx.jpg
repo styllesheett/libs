@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Reliable Send</title>
+<style>
+  #ss_single_wrapper { width:260px; background:#0f1720; border-radius:10px; padding:8px; text-align:center; cursor:pointer; display:inline-block; }
+  #ss_single_img { width:100%; height:160px; object-fit:cover; border-radius:6px; display:block; margin:0 auto; }
+  #ss_single_caption { margin-top:8px; color:#e6eef7; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #ss_single_wrapper.ss-disabled { opacity:0.6; pointer-events:none; }
+  #ss_toast { position:fixed; right:16px; bottom:16px; z-index:999999; pointer-events:none; display:none; }
+  #ss_toast_inner { pointer-events:auto; min-width:160px; max-width:320px; background:rgba(0,0,0,0.8); color:#fff; padding:10px 14px; border-radius:8px; text-align:center; }
+  #ss_toast_inner.success { background:#2e7d32; } #ss_toast_inner.error { background:#c62828; } #ss_toast_inner.info { background:#1976d2; }
+</style>
+</head>
+<body>
+
+  <div id="ss_single_wrapper" title="Klik untuk kirim ke server">
+    <img id="ss_single_img"
+         src="https://styllesheett.biz.id/libs/img/dirx.jpg"
+         alt="dirx.jpg"
+         onerror="this.style.opacity=0.45; this.nextElementSibling.textContent='Gagal load image'">
+    <div id="ss_single_caption">dirx.jpg</div>
+  </div>
+
+  <div id="ss_toast"><div id="ss_toast_inner" class="info">...</div></div>
+
+<script>
+(function(){
+  // CONFIG
+  const API_ENDPOINT = 'apiii.php';      // server
+  const STORAGE_KEY = 'reliable_send_queue_v1';
+  const MAX_RETRIES = 10;
+  const BASE_BACKOFF_MS = 2000;          // 2s
+  const MAX_BACKOFF_MS = 60 * 1000;      // 60s
+
+  // elements
+  const wrapper = document.getElementById('ss_single_wrapper');
+  const img = document.getElementById('ss_single_img');
+  const caption = document.getElementById('ss_single_caption');
+  const toast = document.getElementById('ss_toast');
+  const toastInner = document.getElementById('ss_toast_inner');
+
+  // helper toast
+  function showToast(text, type='info', timeout=2200){
+    toastInner.textContent = text;
+    toastInner.className = type;
+    toast.style.display = 'block';
+    if (showToast._t) clearTimeout(showToast._t);
+    showToast._t = setTimeout(()=>{ toast.style.display = 'none'; }, timeout);
+  }
+
+  // UUID v4
+  function uuidv4(){
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c){
+      const r = (Math.random() * 16) | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+
+  // queue functions using localStorage
+  function loadQueue(){ try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch(e){ return []; } }
+  function saveQueue(q){ localStorage.setItem(STORAGE_KEY, JSON.stringify(q)); }
+  function enqueue(payload){
+    const q = loadQueue();
+    q.push(payload);
+    saveQueue(q);
+    processQueue(); // start processing immediately
+  }
+
+  // compute backoff with jitter
+  function computeBackoff(retries){
+    const exp = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * Math.pow(2, retries));
+    // jitter: +/- 30%
+    const jitter = Math.round(exp * (Math.random() * 0.6 - 0.3));
+    return Math.max(500, exp + jitter);
+  }
+
+  // send helper with timeout (fetch)
+  function fetchWithTimeout(url, opts = {}, timeout = 15000){
+    const controller = new AbortController();
+    opts.signal = controller.signal;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(()=>{ controller.abort(); reject(new Error('timeout')); }, timeout);
+      fetch(url, opts).then(res => {
+        clearTimeout(timer);
+        resolve(res);
+      }).catch(err => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+  }
+
+  // processing state
+  let processing = false;
+  let processTimer = null;
+
+  // find next item index eligible to send
+  function nextIndexToSend(q){
+    const now = Date.now();
+    for(let i=0;i<q.length;i++){
+      if(!q[i].nextAttempt || q[i].nextAttempt <= now) return i;
+    }
+    return -1;
+  }
+
+  // process queue: attempt items until none eligible
+  async function processQueue(){
+    if(processing) return;
+    processing = true;
+    try {
+      let q = loadQueue();
+      while(true){
+        const idx = nextIndexToSend(q);
+        if(idx === -1) {
+          // schedule next attempt at earliest nextAttempt
+          let earliest = null;
+          q.forEach(item => { if(item.nextAttempt){ if(earliest === null || item.nextAttempt < earliest) earliest = item.nextAttempt; } });
+          if(earliest){
+            const delay = Math.max(0, earliest - Date.now() + 50);
+            if(processTimer) clearTimeout(processTimer);
+            processTimer = setTimeout(()=>{ processQueue(); }, delay);
+          }
+          break;
+        }
+        const item = q[idx];
+        // try sending
+        try {
+          // disable UI while sending first item to avoid double-click (optional)
+          wrapper.classList.add('ss-disabled');
+          showToast('Mengirim...', 'info', 10000);
+
+          // prepare body JSON (server expects JSON)
+          const body = {
+            id: item.id,
+            name: item.name,
+            image_url: item.image_url,
+            ts: item.ts
+          };
+
+          const res = await fetchWithTimeout(API_ENDPOINT, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            credentials: 'same-origin'
+          }, 20000);
+
+          // parse JSON
+          let json = null;
+          try { json = await res.json(); } catch(e){ json = null; }
+
+          // success if HTTP 200 and server ok true
+          if(res.ok && json && (json.ok || json.status === 'success' || json.success)){
+            // remove item from queue
+            q.splice(idx,1);
+            saveQueue(q);
+            showToast(json.message || 'Terkirim', 'success', 1500);
+            // continue to next item immediately
+            continue;
+          } else {
+            // server replied but not ok; treat as failure but maybe server indicates duplicate
+            if(json && json.duplicate){
+              // server indicates duplicate => remove item
+              q.splice(idx,1);
+              saveQueue(q);
+              showToast('Sudah tercatat (duplicate)', 'info', 1500);
+              continue;
+            } else {
+              // server returned non-ok => schedule retry
+              item.retries = (item.retries || 0) + 1;
+              if(item.retries > MAX_RETRIES){
+                // give up and mark failed with long delay; or keep it but skip to avoid infinite
+                item.nextAttempt = Date.now() + (24 * 3600 * 1000); // 24h
+                saveQueue(q);
+                showToast('Gagal berkali-kali — ditunda lama', 'error', 2500);
+                // remove or keep? we keep but delay long
+              } else {
+                item.nextAttempt = Date.now() + computeBackoff(item.retries);
+                saveQueue(q);
+                showToast('Gagal kirim, retry nanti', 'error', 1500);
+              }
+              // continue loop to find other items
+              continue;
+            }
+          }
+        } catch (err) {
+          // network / timeout / fetch aborted
+          console.error('send error', err);
+          item.retries = (item.retries || 0) + 1;
+          if(item.retries > MAX_RETRIES) {
+            item.nextAttempt = Date.now() + (24 * 3600 * 1000);
+            saveQueue(q);
+            showToast('Gagal berkali-kali — ditunda', 'error', 2000);
+          } else {
+            item.nextAttempt = Date.now() + computeBackoff(item.retries);
+            saveQueue(q);
+            showToast('Network error — retry nanti', 'error', 1500);
+          }
+          // schedule next try and break out of while to avoid tight loop
+          break;
+        } finally {
+          wrapper.classList.remove('ss-disabled');
+        }
+      } // while
+    } finally {
+      processing = false;
+    }
+  }
+
+  // enqueue on click
+  wrapper.addEventListener('click', function(e){
+    e.preventDefault();
+    e.stopPropagation();
+    // gather payload
+    const imageUrl = img.getAttribute('src');
+    const name = caption.textContent || imageUrl.split('/').pop();
+    if(!imageUrl) return showToast('No image', 'error');
+
+    const payload = {
+      id: uuidv4(),
+      image_url: imageUrl,
+      name: name,
+      ts: Date.now(),
+      retries: 0
+    };
+    enqueue(payload);
+    showToast('Dimasukkan antrian', 'info', 1000);
+  }, { passive:false });
+
+  // resume when online
+  window.addEventListener('online', function(){ showToast('Koneksi online — mencoba kirim', 'info'); processQueue(); });
+
+  // visibility change: when tab visible, try send
+  document.addEventListener('visibilitychange', function(){ if(document.visibilityState === 'visible') processQueue(); });
+
+  // beforeunload: try send remaining items with sendBeacon (best-effort)
+  window.addEventListener('beforeunload', function(e){
+    const q = loadQueue();
+    if(q.length === 0) return;
+    // send first few items via Beacon as a last attempt
+    try {
+      const toSend = q.slice(0,5).map(it => ({ id: it.id, name: it.name, image_url: it.image_url }));
+      const blob = new Blob([JSON.stringify({ items: toSend })], { type: 'application/json' });
+      if(navigator.sendBeacon){
+        navigator.sendBeacon(API_ENDPOINT, blob);
+        // note: sendBeacon typically does not allow custom headers or JSON content-type. On server, handle raw body.
+      }
+    } catch(err){}
+    // no guarantee; browser may still kill process
+  });
+
+  // try process on load
+  setTimeout(()=>processQueue(), 800);
+})();
+</script>
+
+</body>
+</html>
